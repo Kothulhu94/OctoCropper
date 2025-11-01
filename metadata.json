@@ -1,0 +1,5 @@
+{
+  "name": "OctoCropper",
+  "description": "An advanced image cropping tool. Upload an image, define custom-shaped regions by adding points to edges, merge multiple regions, and download the cropped results individually or as a single zip file.",
+  "requestFramePermissions": []
+}
