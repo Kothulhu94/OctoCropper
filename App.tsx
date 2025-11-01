@@ -8,6 +8,7 @@ declare const saveAs: any;
 const HANDLE_SIZE = 12; // Visual size of handles
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 10;
+const MAX_HISTORY_STATES = 50;
 
 // --- Helper Functions (Pure) ---
 const getCanvasPos = (e: React.MouseEvent | React.TouchEvent | MouseEvent | TouchEvent, canvas: HTMLCanvasElement, transform: ViewTransform): Point | null => {
@@ -70,6 +71,22 @@ const TrashIcon: React.FC<{ className?: string }> = ({ className = "mr-1" }) => 
     </svg>
 );
 
+const HistoryIcon: React.FC<{ className?: string }> = ({ className = "mr-1" }) => (
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={`w-4 h-4 inline-block align-middle ${className}`}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 11.667 0m-11.667 0a8.25 8.25 0 0 1 11.667 0m0 0v-4.992m0 0h-4.992m4.992 0-3.181-3.183a8.25 8.25 0 0 0-11.667 0m11.667 0a8.25 8.25 0 0 1-11.667 0" />
+    </svg>
+);
+
+const RedoIcon: React.FC<{ className?: string }> = ({ className = "w-5 h-5" }) => (
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="m15 15-6 6m0 0 6-6m-6 6V9a6 6 0 0 1 12 0v3" />
+    </svg>
+);
+
+interface HistoryState {
+    regions: Region[];
+    description: string;
+}
 
 export default function App() {
     const [originalImage, setOriginalImage] = useState<HTMLImageElement | null>(null);
@@ -83,10 +100,13 @@ export default function App() {
     const [isDeleteRegionMode, setIsDeleteRegionMode] = useState(false);
     const [cursor, setCursor] = useState('default');
     const [viewTransform, setViewTransform] = useState<ViewTransform>({ zoom: 1, offset: { x: 0, y: 0 } });
+    const [history, setHistory] = useState<{ stack: HistoryState[], currentIndex: number }>({ stack: [], currentIndex: -1 });
+    const [isLogVisible, setIsLogVisible] = useState(false);
 
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const canvasContainerRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const regionsBeforeDragRef = useRef<Region[] | null>(null);
     
     const draggingStateRef = useRef<DraggingState>({
         isDragging: false,
@@ -96,6 +116,28 @@ export default function App() {
         dragMode: null,
         mouseOffset: { x: 0, y: 0 },
     });
+
+    const updateRegionsAndHistory = useCallback((newRegionsCallback: (prevRegions: Region[]) => Region[], description: string) => {
+        setRegions(prevRegions => {
+            const newRegions = newRegionsCallback(prevRegions);
+    
+            setHistory(prevHistory => {
+                const newStack = prevHistory.stack.slice(0, prevHistory.currentIndex + 1);
+                newStack.push({ regions: newRegions, description });
+    
+                if (newStack.length > MAX_HISTORY_STATES) {
+                    newStack.shift();
+                }
+    
+                return {
+                    stack: newStack,
+                    currentIndex: newStack.length - 1,
+                };
+            });
+    
+            return newRegions;
+        });
+    }, []);
 
     const fitToScreen = useCallback(() => {
         const canvas = canvasRef.current;
@@ -220,7 +262,10 @@ export default function App() {
             const img = new Image();
             img.onload = () => {
                 setOriginalImage(img);
-                setRegions([]);
+                const initialRegions: Region[] = [];
+                const initialHistoryState: HistoryState = { regions: initialRegions, description: "Image Loaded" };
+                setHistory({ stack: [initialHistoryState], currentIndex: 0 });
+                setRegions(initialRegions);
                 setProcessedImages([]);
                 setIsSelectMode(false);
                 setMultiSelectRegions(new Set());
@@ -250,7 +295,7 @@ export default function App() {
                 h: defaultSize,
             }]
         };
-        setRegions(prev => [...prev, newRegion]);
+        updateRegionsAndHistory(prev => [...prev, newRegion], "Add Region");
     };
     
     const cancelAddPointMode = () => {
@@ -305,11 +350,6 @@ export default function App() {
         }
     };
     
-    const updateSelectionDependentButtons = useCallback(() => {
-        // This function is now mostly for logic separation,
-        // as button disabled states are handled in JSX.
-    }, []);
-
     const findClosestEdgePoint = useCallback((pos: Point, allRegions: Region[]) => {
         let minDistance = Infinity;
         let closestRegion: Region | null = null;
@@ -363,9 +403,9 @@ export default function App() {
         const { region, partIndex, segmentIndex, newPoint } = findClosestEdgePoint(pos, regions);
 
         if (region && partIndex !== -1 && segmentIndex !== -1 && newPoint) {
-            setRegions(prevRegions => {
-                const newRegions = [...prevRegions];
-                const regionToUpdate = newRegions.find(r => r.id === region.id);
+            updateRegionsAndHistory(prevRegions => {
+                const newRegions = JSON.parse(JSON.stringify(prevRegions));
+                const regionToUpdate = newRegions.find((r: Region) => r.id === region.id);
                 if (!regionToUpdate) return prevRegions;
 
                 const partToUpdate = regionToUpdate.parts[partIndex];
@@ -384,29 +424,33 @@ export default function App() {
                     partToUpdate.points.splice(segmentIndex + 1, 0, newPoint);
                 }
                 return newRegions;
-            });
+            }, "Add Point");
         }
     };
 
     const mergeSelectedRegions = () => {
         if (multiSelectRegions.size < 2) return;
-        const regionsToMerge: Region[] = [];
-        const remainingRegions: Region[] = [];
-        regions.forEach(r => {
-            if (multiSelectRegions.has(r.id)) {
-                regionsToMerge.push(r);
-            } else {
-                remainingRegions.push(r);
-            }
-        });
-        const newParts = regionsToMerge.flatMap(r => r.parts);
-        const mergedRegion: Region = { id: Date.now(), parts: newParts };
-        setRegions([...remainingRegions, mergedRegion]);
+        
+        updateRegionsAndHistory(prevRegions => {
+            const regionsToMerge: Region[] = [];
+            const remainingRegions: Region[] = [];
+            prevRegions.forEach(r => {
+                if (multiSelectRegions.has(r.id)) {
+                    regionsToMerge.push(r);
+                } else {
+                    remainingRegions.push(r);
+                }
+            });
+            const newParts = regionsToMerge.flatMap(r => r.parts);
+            const mergedRegion: Region = { id: Date.now(), parts: newParts };
+            return [...remainingRegions, mergedRegion];
+        }, "Merge Regions");
+        
         setMultiSelectRegions(new Set());
     };
 
     const clearAllRegions = () => {
-        setRegions([]);
+        updateRegionsAndHistory(() => [], "Clear All Regions");
         setProcessedImages([]);
         setIsSelectMode(false);
         setMultiSelectRegions(new Set());
@@ -473,7 +517,7 @@ export default function App() {
         if (isDeleteRegionMode) {
             const hit = getHitRegion(pos);
             if (hit.region && hit.mode === 'body') {
-                setRegions(prevRegions => prevRegions.filter(r => r.id !== hit.region!.id));
+                updateRegionsAndHistory(prevRegions => prevRegions.filter(r => r.id !== hit.region!.id), "Delete Region");
             }
             return;
         }
@@ -486,7 +530,7 @@ export default function App() {
         if (isDeletePointMode) {
             const hit = getHitRegion(pos);
             if (hit.region && hit.part && hit.part.type === 'poly' && hit.vertexIndex !== -1) {
-                setRegions(prevRegions => {
+                updateRegionsAndHistory(prevRegions => {
                     const newRegions = JSON.parse(JSON.stringify(prevRegions));
                     const regionToUpdate = newRegions.find((r: Region) => r.id === hit.region!.id);
                     if (!regionToUpdate) return prevRegions;
@@ -495,9 +539,8 @@ export default function App() {
                     if (partToUpdate.type === 'poly' && partToUpdate.points.length > 3) {
                          partToUpdate.points.splice(hit.vertexIndex, 1);
                     }
-                    // else: do nothing, cannot delete if it makes the poly invalid
                     return newRegions;
-                });
+                }, "Delete Point");
             }
             return;
         }
@@ -520,6 +563,7 @@ export default function App() {
         }
 
         if (hit.region) {
+            regionsBeforeDragRef.current = regions;
             draggingStateRef.current = {
                 isDragging: true,
                 selectedRegion: hit.region,
@@ -633,6 +677,24 @@ export default function App() {
     
     const onMouseUp = () => {
         if (draggingStateRef.current.isDragging) {
+            if (regionsBeforeDragRef.current && JSON.stringify(regions) !== JSON.stringify(regionsBeforeDragRef.current)) {
+                const { dragMode } = draggingStateRef.current;
+                let description = "Modify Region";
+                if (dragMode === 'body') description = "Move Region";
+                else if (dragMode === 'vertex') description = "Move Vertex";
+                else description = "Resize Region";
+
+                setHistory(prevHistory => {
+                    const newStack = prevHistory.stack.slice(0, prevHistory.currentIndex + 1);
+                    newStack.push({ regions: regions, description });
+                    if (newStack.length > MAX_HISTORY_STATES) newStack.shift();
+                    return {
+                        stack: newStack,
+                        currentIndex: newStack.length - 1,
+                    };
+                });
+            }
+            regionsBeforeDragRef.current = null;
             draggingStateRef.current.isDragging = false;
         }
     };
@@ -740,12 +802,58 @@ export default function App() {
         });
     };
     
+    const revertToState = (index: number) => {
+        setHistory(prev => ({ ...prev, currentIndex: index }));
+        setRegions(history.stack[index].regions);
+    };
+
+    const handleRedo = () => {
+        setHistory(prev => {
+            if (prev.currentIndex < prev.stack.length - 1) {
+                const newIndex = prev.currentIndex + 1;
+                setRegions(prev.stack[newIndex].regions);
+                return { ...prev, currentIndex: newIndex };
+            }
+            return prev;
+        });
+    };
+    
     const isActionDisabled = !originalImage;
     const isMergeDisabled = multiSelectRegions.size < 2 || isActionDisabled;
     const isProcessDisabled = regions.length === 0 || isActionDisabled;
 
     return (
-        <div className="min-h-screen flex flex-col items-center p-4 md:p-8 bg-gray-900 text-gray-200">
+        <div className="min-h-screen flex flex-col items-center p-4 md:p-8 bg-gray-900 text-gray-200 relative">
+            {isLogVisible && (
+                <div className="absolute top-28 left-4 z-20 w-64 bg-gray-800 border border-gray-700 rounded-lg shadow-2xl text-white">
+                    <div className="flex justify-between items-center p-3 border-b border-gray-700">
+                        <h3 className="font-bold text-lg">Action Log</h3>
+                        <div className='flex items-center gap-2'>
+                           <button 
+                                onClick={handleRedo} 
+                                disabled={history.currentIndex >= history.stack.length - 1}
+                                className="disabled:opacity-40 disabled:cursor-not-allowed text-gray-300 hover:text-white"
+                                title="Redo"
+                           >
+                                <RedoIcon />
+                           </button>
+                           <button onClick={() => setIsLogVisible(false)} className="text-gray-400 hover:text-white">&times;</button>
+                        </div>
+                    </div>
+                    <ul className="max-h-96 overflow-y-auto p-2">
+                        {history.stack.map((state, index) => (
+                            <li key={index}>
+                                <button 
+                                    onClick={() => revertToState(index)}
+                                    className={`w-full text-left p-2 my-1 rounded-md text-sm transition-colors duration-150 ${index === history.currentIndex ? 'bg-blue-600 font-semibold' : 'bg-gray-700 hover:bg-gray-600'} ${index > history.currentIndex ? 'opacity-50' : ''}`}
+                                >
+                                    {state.description}
+                                </button>
+                            </li>
+                        )).reverse()}
+                    </ul>
+                </div>
+            )}
             <div className="w-full max-w-7xl">
                 <header className="text-center mb-6">
                     <h1 className="text-3xl md:text-4xl font-bold text-white">OctoCropper</h1>
@@ -755,45 +863,53 @@ export default function App() {
                 </header>
 
                 <div className="bg-gray-800 p-4 rounded-lg shadow-xl mb-6">
-                    <div className="flex flex-wrap gap-3 justify-center items-center">
-                        <label htmlFor="file-input" className="cursor-pointer bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200">
-                            Upload Image
-                        </label>
-                        <input id="file-input" ref={fileInputRef} type="file" accept="image/*" onChange={handleImageUpload} className="hidden" />
+                    <div className="flex flex-row gap-4 justify-between items-stretch">
+                        <div className="flex flex-wrap gap-3 justify-start items-center">
+                            <label htmlFor="file-input" className="cursor-pointer bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200">
+                                Upload Image
+                            </label>
+                            <input id="file-input" ref={fileInputRef} type="file" accept="image/*" onChange={handleImageUpload} className="hidden" />
 
-                        <button onClick={addRegion} disabled={isActionDisabled} className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed">
-                            Add Crop Region
-                        </button>
-                        
-                        <button onClick={startAddPointMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${isWaitingForPointClick ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-teal-600 hover:bg-teal-700'}`}>
-                            <PlusIcon /> Add Point
-                        </button>
+                            <button onClick={addRegion} disabled={isActionDisabled} className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed">
+                                Add Crop Region
+                            </button>
+                            
+                            <div className="flex rounded-lg shadow-md">
+                                <button onClick={startAddPointMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 rounded-l-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${isWaitingForPointClick ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-teal-600 hover:bg-teal-700'}`}>
+                                    <PlusIcon /> Add Point
+                                </button>
+                                <button onClick={toggleDeletePointMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 rounded-r-lg border-l border-rose-800 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${isDeletePointMode ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-rose-600 hover:bg-rose-700'}`}>
+                                    <MinusIcon /> Delete Point
+                                </button>
+                            </div>
+                            
+                            <div className="flex rounded-lg shadow-md">
+                                <button onClick={toggleSelectMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-l-lg ${isSelectMode ? 'bg-fuchsia-700 hover:bg-fuchsia-800' : 'bg-fuchsia-500 hover:bg-fuchsia-600'}`}>
+                                    Select Mode: {isSelectMode ? 'ON' : 'OFF'}
+                                </button>
+                                <button onClick={mergeSelectedRegions} disabled={isMergeDisabled} className="bg-fuchsia-800 hover:bg-fuchsia-900 text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-r-lg border-l border-fuchsia-950">
+                                    Merge Selected
+                                </button>
+                            </div>
 
-                         <button onClick={toggleDeletePointMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${isDeletePointMode ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-rose-600 hover:bg-rose-700'}`}>
-                            <MinusIcon /> Delete Point
-                        </button>
-                        
-                        <div className="flex rounded-lg shadow-md">
-                            <button onClick={toggleSelectMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-l-lg ${isSelectMode ? 'bg-fuchsia-700 hover:bg-fuchsia-800' : 'bg-fuchsia-500 hover:bg-fuchsia-600'}`}>
-                                Select Mode: {isSelectMode ? 'ON' : 'OFF'}
+                             <button onClick={() => setIsLogVisible(prev => !prev)} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed ${isLogVisible ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-gray-600 hover:bg-gray-700'}`}>
+                                <HistoryIcon /> Log
                             </button>
-                            <button onClick={mergeSelectedRegions} disabled={isMergeDisabled} className="bg-fuchsia-800 hover:bg-fuchsia-900 text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-r-lg border-l border-fuchsia-950">
-                                Merge Selected
-                            </button>
+
+                            <div className="flex rounded-lg shadow-md">
+                                <button onClick={toggleDeleteRegionMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-l-lg ${isDeleteRegionMode ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-red-600 hover:bg-red-700'}`}>
+                                    <TrashIcon /> Delete Region
+                                </button>
+                                <button onClick={clearAllRegions} disabled={isActionDisabled} className="bg-red-800 hover:bg-red-900 text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-r-lg border-l border-red-950">
+                                    Clear All
+                                </button>
+                            </div>
                         </div>
                         
-                        <button onClick={processRegions} disabled={isProcessDisabled} className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed">
-                            Process & Download
+                        <button onClick={processRegions} disabled={isProcessDisabled} className="bg-green-600 hover:bg-green-700 text-white font-bold px-12 text-xl rounded-lg shadow-md transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
+                            Process
                         </button>
 
-                        <div className="flex rounded-lg shadow-md">
-                            <button onClick={toggleDeleteRegionMode} disabled={isActionDisabled} className={`text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-l-lg ${isDeleteRegionMode ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-red-600 hover:bg-red-700'}`}>
-                                <TrashIcon /> Delete Region
-                            </button>
-                            <button onClick={clearAllRegions} disabled={isActionDisabled} className="bg-red-800 hover:bg-red-900 text-white font-bold py-2 px-4 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-r-lg border-l border-red-950">
-                                Clear All
-                            </button>
-                        </div>
                     </div>
                 </div>
 
